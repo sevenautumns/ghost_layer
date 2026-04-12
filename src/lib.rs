@@ -1,4 +1,5 @@
-use std::ffi::CStr;
+use std::cell::RefCell;
+use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::slice;
 
@@ -8,6 +9,30 @@ use lopdf::{
     xobject, Document, Object, ObjectId, Stream, StringFormat,
 };
 use serde::Deserialize;
+
+// --- 0. ERROR REPORTING ---
+
+thread_local! {
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+fn set_last_error(e: &dyn std::error::Error) {
+    let msg = CString::new(e.to_string()).unwrap_or_else(|_| CString::new("unknown error").unwrap());
+    LAST_ERROR.with(|cell| *cell.borrow_mut() = Some(msg));
+}
+
+fn clear_last_error() {
+    LAST_ERROR.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// Returns a pointer to the last error message, or NULL if no error occurred.
+/// The pointer is valid until the next FFI call on this thread.
+#[no_mangle]
+pub extern "C" fn pdf_get_last_error() -> *const c_char {
+    LAST_ERROR.with(|cell| {
+        cell.borrow().as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
+    })
+}
 
 // --- 1. DATA STRUCTURES ---
 
@@ -185,6 +210,7 @@ pub struct PdfBuilder {
     font_id: Object,
     pages_id: ObjectId,
     page_ids: Vec<Object>,
+    finalized: bool,
 }
 
 impl PdfBuilder {
@@ -192,10 +218,13 @@ impl PdfBuilder {
         let mut doc = Document::with_version("1.5");
         let pages_id = doc.new_object_id();
         let font_id = add_glyphless_font(&mut doc);
-        PdfBuilder { doc, font_id, pages_id, page_ids: vec![] }
+        PdfBuilder { doc, font_id, pages_id, page_ids: vec![], finalized: false }
     }
 
-    fn add_page(&mut self, image_bytes: &[u8], json_input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn add_page(&mut self, image_bytes: &[u8], json_input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if self.finalized {
+            return Err("add_page called after finalize".into());
+        }
         let input: OCRInput = serde_json::from_str(json_input)?;
         let img_reader = image::load_from_memory(image_bytes)?;
 
@@ -322,7 +351,8 @@ impl PdfBuilder {
 
                     let char_count = word.text.encode_utf16().count() as f64;
                     let h_scale = if char_count > 0.0 {
-                        K_CHAR_WIDTH * (100.0 * word_length) / (font_size * char_count)
+                        let raw = K_CHAR_WIDTH * (100.0 * word_length) / (font_size * char_count);
+                        raw.clamp(1.0, 2000.0)
                     } else {
                         100.0
                     };
@@ -338,7 +368,9 @@ impl PdfBuilder {
         }
 
         let content = Content { operations: ops };
-        let content_id = self.doc.add_object(Stream::new(dictionary! {}, content.encode()?));
+        let mut content_stream = Stream::new(dictionary! {}, content.encode()?);
+        let _ = content_stream.compress();
+        let content_id = self.doc.add_object(content_stream);
 
         let page_dict = dictionary! {
             "Type" => "Page",
@@ -357,7 +389,8 @@ impl PdfBuilder {
         Ok(())
     }
 
-    fn finalize(mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn finalize(mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.finalized = true;
         let count = self.page_ids.len() as i64;
         let pages_dict = dictionary! {
             "Type" => "Pages",
@@ -384,14 +417,15 @@ impl PdfBuilder {
 pub struct PdfBuffer {
     pub data: *mut u8,
     pub len: usize,
+    capacity: usize,
 }
 
 fn vec_to_pdf_buffer(mut vec: Vec<u8>) -> PdfBuffer {
-    vec.shrink_to_fit();
     let len = vec.len();
+    let capacity = vec.capacity();
     let data = vec.as_mut_ptr();
     std::mem::forget(vec);
-    PdfBuffer { data, len }
+    PdfBuffer { data, len, capacity }
 }
 
 #[no_mangle]
@@ -406,24 +440,28 @@ pub extern "C" fn pdf_builder_add_page(
     img_len: usize,
     json_ptr: *const c_char,
 ) -> i32 {
-    if builder.is_null() || img_ptr.is_null() || json_ptr.is_null() { return 0; }
+    if builder.is_null() || img_ptr.is_null() || json_ptr.is_null() {
+        return 0;
+    }
     let builder = unsafe { &mut *builder };
     let image_bytes = unsafe { slice::from_raw_parts(img_ptr, img_len) };
     let json_str = unsafe { CStr::from_ptr(json_ptr).to_string_lossy() };
 
     match builder.add_page(image_bytes, &json_str) {
-        Ok(_) => 1,
-        Err(_) => 0,
+        Ok(_) => { clear_last_error(); 1 }
+        Err(e) => { set_last_error(e.as_ref()); 0 }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn pdf_builder_finalize(builder: *mut PdfBuilder) -> PdfBuffer {
-    if builder.is_null() { return PdfBuffer { data: std::ptr::null_mut(), len: 0 }; }
+    if builder.is_null() {
+        return PdfBuffer { data: std::ptr::null_mut(), len: 0, capacity: 0 };
+    }
     let builder = unsafe { Box::from_raw(builder) };
     match builder.finalize() {
-        Ok(vec) => vec_to_pdf_buffer(vec),
-        Err(_) => PdfBuffer { data: std::ptr::null_mut(), len: 0 },
+        Ok(vec) => { clear_last_error(); vec_to_pdf_buffer(vec) }
+        Err(e) => { set_last_error(e.as_ref()); PdfBuffer { data: std::ptr::null_mut(), len: 0, capacity: 0 } }
     }
 }
 
@@ -442,7 +480,7 @@ pub extern "C" fn generate_pdf_from_ocr(
     json_ptr: *const c_char,
 ) -> PdfBuffer {
     if img_ptr.is_null() || json_ptr.is_null() {
-        return PdfBuffer { data: std::ptr::null_mut(), len: 0 };
+        return PdfBuffer { data: std::ptr::null_mut(), len: 0, capacity: 0 };
     }
     let image_bytes = unsafe { slice::from_raw_parts(img_ptr, img_len) };
     let json_str = unsafe { CStr::from_ptr(json_ptr).to_string_lossy() };
@@ -452,15 +490,15 @@ pub extern "C" fn generate_pdf_from_ocr(
         .and_then(|_| builder.finalize());
 
     match result {
-        Ok(vec) => vec_to_pdf_buffer(vec),
-        Err(_) => PdfBuffer { data: std::ptr::null_mut(), len: 0 },
+        Ok(vec) => { clear_last_error(); vec_to_pdf_buffer(vec) }
+        Err(e) => { set_last_error(e.as_ref()); PdfBuffer { data: std::ptr::null_mut(), len: 0, capacity: 0 } }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn free_pdf_buffer(buf: PdfBuffer) {
     if !buf.data.is_null() {
-        unsafe { let _ = Vec::from_raw_parts(buf.data, buf.len, buf.len); }
+        unsafe { let _ = Vec::from_raw_parts(buf.data, buf.len, buf.capacity); }
     }
 }
 
