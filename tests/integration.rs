@@ -14,9 +14,15 @@ fn test_ffi_interface() {
 
     let c_json = CString::new(json_content).expect("CString conversion");
 
+    let img_reader = image::load_from_memory(&img_bytes).expect("Load image for dimensions");
+    let (width, height) = (img_reader.width(), img_reader.height());
+
     let pdf_buffer = generate_pdf_from_ocr(
         img_bytes.as_ptr(),
         img_bytes.len(),
+        width,
+        height,
+        300.0,
         c_json.as_ptr()
     );
 
@@ -50,7 +56,10 @@ fn test_multipage_builder() {
         let json_content = fs::read_to_string(json).expect("Read JSON");
         let c_json = CString::new(json_content).expect("CString conversion");
 
-        let ok = pdf_builder_add_page(builder, img_bytes.as_ptr(), img_bytes.len(), c_json.as_ptr());
+        let img_reader = image::load_from_memory(&img_bytes).expect("Load image for dimensions");
+        let (width, height) = (img_reader.width(), img_reader.height());
+
+        let ok = pdf_builder_add_page(builder, img_bytes.as_ptr(), img_bytes.len(), width, height, 300.0, c_json.as_ptr());
         assert_eq!(ok, 1, "add_page failed for {png}");
     }
 
@@ -76,8 +85,11 @@ fn test_builder_free_without_finalize() {
     let json_content = fs::read_to_string("tests/en_ltr.json").expect("Read JSON");
     let c_json = CString::new(json_content).expect("CString conversion");
 
+    let img_reader = image::load_from_memory(&img_bytes).expect("Load image for dimensions");
+    let (width, height) = (img_reader.width(), img_reader.height());
+
     let builder = pdf_builder_new();
-    let _ = pdf_builder_add_page(builder, img_bytes.as_ptr(), img_bytes.len(), c_json.as_ptr());
+    let _ = pdf_builder_add_page(builder, img_bytes.as_ptr(), img_bytes.len(), width, height, 300.0, c_json.as_ptr());
     // Drop without finalizing — must not leak or crash
     pdf_builder_free(builder);
 }

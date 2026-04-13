@@ -19,6 +19,8 @@
             "aarch64-apple-ios"       # iPhone + iPad (physisch, Apple Silicon)
             "aarch64-apple-ios-sim"   # Simulator (Apple Silicon Mac)
             "x86_64-apple-ios"        # Simulator (Intel Mac)
+            "aarch64-apple-ios-macabi" # Mac Catalyst (Apple Silicon)
+            "x86_64-apple-ios-macabi"  # Mac Catalyst (Intel)
             "aarch64-apple-darwin"    # macOS (Apple Silicon)
             "x86_64-apple-darwin"     # macOS (Intel)
           ];

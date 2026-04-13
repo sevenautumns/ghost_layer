@@ -221,15 +221,14 @@ impl PdfBuilder {
         PdfBuilder { doc, font_id, pages_id, page_ids: vec![], finalized: false }
     }
 
-    pub fn add_page(&mut self, image_bytes: &[u8], json_input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn add_page(&mut self, image_bytes: &[u8], width_px: u32, height_px: u32, dpi: f64, json_input: &str) -> Result<(), Box<dyn std::error::Error>> {
         if self.finalized {
             return Err("add_page called after finalize".into());
         }
         let input: OCRInput = serde_json::from_str(json_input)?;
-        let img_reader = image::load_from_memory(image_bytes)?;
 
-        let width_pts = img_reader.width() as f64;
-        let height_pts = img_reader.height() as f64;
+        let width_pts = (width_px as f64) * (72.0 / dpi);
+        let height_pts = (height_px as f64) * (72.0 / dpi);
 
         let image_stream = xobject::image_from(image_bytes.to_vec())?;
         let image_id = self.doc.add_object(Object::Stream(image_stream));
@@ -438,6 +437,9 @@ pub extern "C" fn pdf_builder_add_page(
     builder: *mut PdfBuilder,
     img_ptr: *const u8,
     img_len: usize,
+    width_px: u32,
+    height_px: u32,
+    dpi: f64,
     json_ptr: *const c_char,
 ) -> i32 {
     if builder.is_null() || img_ptr.is_null() || json_ptr.is_null() {
@@ -447,7 +449,7 @@ pub extern "C" fn pdf_builder_add_page(
     let image_bytes = unsafe { slice::from_raw_parts(img_ptr, img_len) };
     let json_str = unsafe { CStr::from_ptr(json_ptr).to_string_lossy() };
 
-    match builder.add_page(image_bytes, &json_str) {
+    match builder.add_page(image_bytes, width_px, height_px, dpi, &json_str) {
         Ok(_) => { clear_last_error(); 1 }
         Err(e) => { set_last_error(e.as_ref()); 0 }
     }
@@ -477,6 +479,9 @@ pub extern "C" fn pdf_builder_free(builder: *mut PdfBuilder) {
 pub extern "C" fn generate_pdf_from_ocr(
     img_ptr: *const u8,
     img_len: usize,
+    width_px: u32,
+    height_px: u32,
+    dpi: f64,
     json_ptr: *const c_char,
 ) -> PdfBuffer {
     if img_ptr.is_null() || json_ptr.is_null() {
@@ -486,7 +491,7 @@ pub extern "C" fn generate_pdf_from_ocr(
     let json_str = unsafe { CStr::from_ptr(json_ptr).to_string_lossy() };
 
     let mut builder = PdfBuilder::new();
-    let result = builder.add_page(image_bytes, &json_str)
+    let result = builder.add_page(image_bytes, width_px, height_px, dpi, &json_str)
         .and_then(|_| builder.finalize());
 
     match result {
