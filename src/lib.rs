@@ -5,19 +5,17 @@ use std::slice;
 
 use lopdf::{
     content::{Content, Operation},
-    dictionary,
-    xobject, Document, Object, ObjectId, Stream, StringFormat,
+    dictionary, xobject, Dictionary, Document, Object, ObjectId, Stream, StringFormat,
 };
 use serde::Deserialize;
-
-// --- 0. ERROR REPORTING ---
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 fn set_last_error(e: &dyn std::error::Error) {
-    let msg = CString::new(e.to_string()).unwrap_or_else(|_| CString::new("unknown error").unwrap());
+    let msg =
+        CString::new(e.to_string()).unwrap_or_else(|_| CString::new("unknown error").unwrap());
     LAST_ERROR.with(|cell| *cell.borrow_mut() = Some(msg));
 }
 
@@ -25,16 +23,14 @@ fn clear_last_error() {
     LAST_ERROR.with(|cell| *cell.borrow_mut() = None);
 }
 
-/// Returns a pointer to the last error message, or NULL if no error occurred.
-/// The pointer is valid until the next FFI call on this thread.
 #[no_mangle]
 pub extern "C" fn pdf_get_last_error() -> *const c_char {
     LAST_ERROR.with(|cell| {
-        cell.borrow().as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
+        cell.borrow()
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr())
     })
 }
-
-// --- 1. DATA STRUCTURES ---
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
 struct Point {
@@ -85,8 +81,6 @@ struct OCRInput {
     paragraphs: Vec<OCRParagraph>,
 }
 
-// --- 2. FONT EMBEDDING ---
-
 const FONT_DATA: &[u8] = include_bytes!("pdf.ttf");
 const FONT_NAME: &str = "f-0-0";
 
@@ -116,15 +110,9 @@ end
 end
 "#;
 
-fn n(name: &str) -> Object {
-    Object::Name(name.as_bytes().to_vec())
-}
-
-fn s(text: &str) -> Object {
-    Object::String(text.as_bytes().to_vec(), StringFormat::Literal)
-}
-
 fn add_glyphless_font(doc: &mut Document) -> Object {
+    let n = |name: &str| Object::Name(name.as_bytes().to_vec());
+    let s = |text: &str| Object::String(text.as_bytes().to_vec(), StringFormat::Literal);
     let font_stream = Stream::new(
         dictionary! {
             "Length1" => FONT_DATA.len() as i64,
@@ -184,8 +172,6 @@ fn add_glyphless_font(doc: &mut Document) -> Object {
     doc.add_object(font_dict).into()
 }
 
-// --- 3. MATH & LOGIC ---
-
 fn prec(n: f64) -> f64 {
     (n * 1000.0).round() / 1000.0
 }
@@ -203,214 +189,426 @@ fn clip_baseline(p1: Point, p2: Point) -> (Point, Point) {
     }
 }
 
-// --- 4. PDF BUILDER ---
-
-pub struct PdfBuilder {
-    doc: Document,
-    font_id: Object,
-    pages_id: ObjectId,
-    page_ids: Vec<Object>,
-    finalized: bool,
+fn add_compressed_content(
+    doc: &mut Document,
+    ops: Vec<Operation>,
+) -> Result<ObjectId, Box<dyn std::error::Error>> {
+    let mut stream = Stream::new(dictionary! {}, Content { operations: ops }.encode()?);
+    let _ = stream.compress();
+    Ok(doc.add_object(stream))
 }
 
-impl PdfBuilder {
-    fn new() -> Self {
-        let mut doc = Document::with_version("1.5");
-        let pages_id = doc.new_object_id();
-        let font_id = add_glyphless_font(&mut doc);
-        PdfBuilder { doc, font_id, pages_id, page_ids: vec![], finalized: false }
+fn get_media_box(
+    doc: &Document,
+    page_id: ObjectId,
+) -> Result<[f64; 4], Box<dyn std::error::Error>> {
+    let mut current = page_id;
+    loop {
+        let dict = doc.get_dictionary(current)?;
+        if let Ok(mb) = dict.get(b"MediaBox") {
+            let arr = mb.as_array()?;
+            if arr.len() >= 4 {
+                return Ok([
+                    arr[0].as_float()? as f64,
+                    arr[1].as_float()? as f64,
+                    arr[2].as_float()? as f64,
+                    arr[3].as_float()? as f64,
+                ]);
+            }
+        }
+        match dict.get(b"Parent").and_then(Object::as_reference) {
+            Ok(parent_id) => current = parent_id,
+            Err(_) => return Err("MediaBox not found in page tree".into()),
+        }
+    }
+}
+
+fn upsert_font(res: &mut Dictionary, font_obj: Object) {
+    let already_present = res
+        .get(b"Font")
+        .ok()
+        .and_then(|o| {
+            if let Object::Dictionary(d) = o {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .map(|d| d.get(FONT_NAME.as_bytes()).is_ok())
+        .unwrap_or(false);
+
+    if already_present {
+        return;
     }
 
-    pub fn add_page(&mut self, image_bytes: &[u8], width_px: u32, height_px: u32, dpi: f64, json_input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        if self.finalized {
-            return Err("add_page called after finalize".into());
+    let font_dict_exists = matches!(res.get(b"Font"), Ok(Object::Dictionary(_)));
+
+    if font_dict_exists {
+        if let Ok(Object::Dictionary(fonts)) = res.get_mut(b"Font") {
+            fonts.set(FONT_NAME, font_obj);
         }
-        let input: OCRInput = serde_json::from_str(json_input)?;
+    } else {
+        let mut fonts = Dictionary::new();
+        fonts.set(FONT_NAME, font_obj);
+        res.set("Font", Object::Dictionary(fonts));
+    }
+}
 
-        let width_pts = (width_px as f64) * (72.0 / dpi);
-        let height_pts = (height_px as f64) * (72.0 / dpi);
-
-        let image_stream = xobject::image_from(image_bytes.to_vec())?;
-        let image_id = self.doc.add_object(Object::Stream(image_stream));
-
-        let image_name = "Im1";
-        let font_ref = Object::Name(FONT_NAME.into());
-
-        let to_pdf_pt = |p: &Point| -> (f64, f64) {
-            (p.x * width_pts, p.y * height_pts)
-        };
-
-        let mut ops = Vec::new();
-
-        // Draw image
-        ops.push(Operation::new("q", vec![]));
-        ops.push(Operation::new("cm", vec![
-            prec(width_pts).into(), 0.into(), 0.into(), prec(height_pts).into(), 0.into(), 0.into()
-        ]));
-        ops.push(Operation::new("Do", vec![Object::Name(image_name.into())]));
-        ops.push(Operation::new("Q", vec![]));
-
-        #[cfg(debug_assertions)]
-        {
-            ops.push(Operation::new("q", vec![]));
-            ops.push(Operation::new("RG", vec![1.into(), 0.into(), 0.into()]));
-            ops.push(Operation::new("w", vec![0.5.into()]));
-
-            for paragraph in &input.paragraphs {
-                for line in &paragraph.lines {
-                    for word in &line.words {
-                        let (wx_tl, wy_tl) = to_pdf_pt(&word.geometry.top_left);
-                        let (wx_bl, wy_bl) = to_pdf_pt(&word.geometry.bottom_left);
-                        let (wx_br, wy_br) = to_pdf_pt(&word.geometry.bottom_right);
-
-                        let wx_tr = wx_tl + (wx_br - wx_bl);
-                        let wy_tr = wy_tl + (wy_br - wy_bl);
-
-                        ops.push(Operation::new("m", vec![prec(wx_bl).into(), prec(wy_bl).into()]));
-                        ops.push(Operation::new("l", vec![prec(wx_br).into(), prec(wy_br).into()]));
-                        ops.push(Operation::new("l", vec![prec(wx_tr).into(), prec(wy_tr).into()]));
-                        ops.push(Operation::new("l", vec![prec(wx_tl).into(), prec(wy_tl).into()]));
-                        ops.push(Operation::new("h", vec![]));
-                        ops.push(Operation::new("S", vec![]));
-                    }
-                }
+fn add_font_to_page_resources(doc: &mut Document, page_id: ObjectId, font_obj: Object) {
+    let res_ref = doc
+        .objects
+        .get(&page_id)
+        .and_then(|o| {
+            if let Object::Dictionary(d) = o {
+                Some(d)
+            } else {
+                None
             }
-            ops.push(Operation::new("Q", vec![]));
+        })
+        .and_then(|d| d.get(b"Resources").ok())
+        .and_then(|o| {
+            if let Object::Reference(id) = o {
+                Some(*id)
+            } else {
+                None
+            }
+        });
+
+    if let Some(res_id) = res_ref {
+        if let Some(Object::Dictionary(res)) = doc.objects.get_mut(&res_id) {
+            upsert_font(res, font_obj);
         }
+        return;
+    }
 
-        // Draw invisible text layer
-        for paragraph in input.paragraphs {
-            ops.push(Operation::new("BT", vec![]));
-            ops.push(Operation::new("Tr", vec![3.into()]));
+    let res_clone = doc
+        .objects
+        .get(&page_id)
+        .and_then(|o| {
+            if let Object::Dictionary(d) = o {
+                Some(d)
+            } else {
+                None
+            }
+        })
+        .and_then(|d| d.get(b"Resources").ok())
+        .and_then(|o| {
+            if let Object::Dictionary(d) = o {
+                Some(d.clone())
+            } else {
+                None
+            }
+        });
 
-            let mut old_x = 0.0;
-            let mut old_y = 0.0;
-            let mut old_fontsize = 0.0;
-            let mut old_dir = Direction::LeftToRight;
-            let mut is_new_block = true;
+    let mut res = res_clone.unwrap_or_default();
+    upsert_font(&mut res, font_obj);
 
-            for line in paragraph.lines {
-                let (lp1, lp2) = clip_baseline(line.geometry.bottom_left, line.geometry.bottom_right);
-                let (lx1, ly1) = to_pdf_pt(&lp1);
-                let (lx2, ly2) = to_pdf_pt(&lp2);
+    if let Some(Object::Dictionary(page_dict)) = doc.objects.get_mut(&page_id) {
+        page_dict.set("Resources", Object::Dictionary(res));
+    }
+}
 
-                let l_dx = lx2 - lx1;
-                let l_dy = ly2 - ly1;
-                let line_len_sq = l_dx * l_dx + l_dy * l_dy;
+fn ocr_operations(
+    width_pts: f64,
+    height_pts: f64,
+    font_ref: Object,
+    input: OCRInput,
+) -> Vec<Operation> {
+    let to_pdf_pt = |p: &Point| -> (f64, f64) { (p.x * width_pts, p.y * height_pts) };
 
-                let theta = l_dy.atan2(l_dx);
-                let a = theta.cos();
-                let b = theta.sin();
-                let c = -theta.sin();
-                let d = theta.cos();
+    let mut ops = Vec::new();
 
-                for word in line.words {
-                    if word.text.trim().is_empty() { continue; }
+    for paragraph in input.paragraphs {
+        ops.push(Operation::new("BT", vec![]));
+        ops.push(Operation::new("Tr", vec![3.into()]));
 
+        let mut old_x = 0.0;
+        let mut old_y = 0.0;
+        let mut old_fontsize = 0.0;
+        let mut old_dir = Direction::LeftToRight;
+        let mut is_new_block = true;
+
+        for line in paragraph.lines {
+            let (lp1, lp2) = clip_baseline(line.geometry.bottom_left, line.geometry.bottom_right);
+            let (lx1, ly1) = to_pdf_pt(&lp1);
+            let (lx2, ly2) = to_pdf_pt(&lp2);
+
+            let l_dx = lx2 - lx1;
+            let l_dy = ly2 - ly1;
+            let line_len_sq = l_dx * l_dx + l_dy * l_dy;
+
+            let theta = l_dy.atan2(l_dx);
+            let a = theta.cos();
+            let b = theta.sin();
+            let c = -theta.sin();
+            let d = theta.cos();
+
+            for word in line.words {
+                if word.text.trim().is_empty() {
+                    continue;
+                }
+
+                let (wx_tl, wy_tl) = to_pdf_pt(&word.geometry.top_left);
+                let (wx_bl, wy_bl) = to_pdf_pt(&word.geometry.bottom_left);
+                let (wx_br, wy_br) = to_pdf_pt(&word.geometry.bottom_right);
+
+                let font_size = ((wx_tl - wx_bl).powi(2) + (wy_tl - wy_bl).powi(2)).sqrt();
+                let word_length = ((wx_br - wx_bl).powi(2) + (wy_br - wy_bl).powi(2)).sqrt();
+
+                if font_size < 0.1 || word_length < 0.1 {
+                    continue;
+                }
+
+                let (target_x, target_y) = (wx_bl, wy_bl);
+
+                let (px, py) = if line_len_sq < 0.001 {
+                    (target_x, target_y)
+                } else {
+                    let t = ((target_x - lx1) * l_dx + (target_y - ly1) * l_dy) / line_len_sq;
+                    (lx1 + t * l_dx, ly1 + t * l_dy)
+                };
+
+                if is_new_block || line.direction != old_dir {
+                    ops.push(Operation::new(
+                        "Tm",
+                        vec![
+                            prec(a).into(),
+                            prec(b).into(),
+                            prec(c).into(),
+                            prec(d).into(),
+                            prec(px).into(),
+                            prec(py).into(),
+                        ],
+                    ));
+                    is_new_block = false;
+                } else {
+                    let dx = px - old_x;
+                    let dy = py - old_y;
+                    let tx = dx * a + dy * b;
+                    let ty = dx * c + dy * d;
+                    ops.push(Operation::new("Td", vec![prec(tx).into(), prec(ty).into()]));
+                }
+
+                old_x = px;
+                old_y = py;
+                old_dir = line.direction;
+
+                if (font_size - old_fontsize).abs() > 0.01 {
+                    ops.push(Operation::new(
+                        "Tf",
+                        vec![font_ref.clone(), prec(font_size).into()],
+                    ));
+                    old_fontsize = font_size;
+                }
+
+                let char_count = word.text.encode_utf16().count() as f64;
+                let h_scale = if char_count > 0.0 {
+                    let raw = K_CHAR_WIDTH * (100.0 * word_length) / (font_size * char_count);
+                    raw.clamp(1.0, 2000.0)
+                } else {
+                    100.0
+                };
+                ops.push(Operation::new("Tz", vec![prec(h_scale).into()]));
+
+                let mut utf16_bytes: Vec<u8> = word
+                    .text
+                    .encode_utf16()
+                    .flat_map(|x| x.to_be_bytes())
+                    .collect();
+                utf16_bytes.push(0x00);
+                utf16_bytes.push(0x20);
+                let hex_str = Object::String(utf16_bytes, StringFormat::Hexadecimal);
+                ops.push(Operation::new("TJ", vec![Object::Array(vec![hex_str])]));
+            }
+        }
+        ops.push(Operation::new("ET", vec![]));
+    }
+
+    ops
+}
+
+fn build_single_page_pdf(
+    image_bytes: &[u8],
+    width_px: u32,
+    height_px: u32,
+    dpi: f64,
+    json_input: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let input: OCRInput = serde_json::from_str(json_input)?;
+
+    let width_pts = (width_px as f64) * (72.0 / dpi);
+    let height_pts = (height_px as f64) * (72.0 / dpi);
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = add_glyphless_font(&mut doc);
+
+    let image_stream = xobject::image_from(image_bytes.to_vec())?;
+    let image_id = doc.add_object(Object::Stream(image_stream));
+
+    let image_name = "Im1";
+    let font_ref = Object::Name(FONT_NAME.into());
+
+    let mut ops = vec![
+        Operation::new("q", vec![]),
+        Operation::new(
+            "cm",
+            vec![
+                prec(width_pts).into(),
+                0.into(),
+                0.into(),
+                prec(height_pts).into(),
+                0.into(),
+                0.into(),
+            ],
+        ),
+        Operation::new("Do", vec![Object::Name(image_name.into())]),
+        Operation::new("Q", vec![]),
+    ];
+
+    #[cfg(debug_assertions)]
+    {
+        let to_pdf_pt = |p: &Point| -> (f64, f64) { (p.x * width_pts, p.y * height_pts) };
+
+        ops.push(Operation::new("q", vec![]));
+        ops.push(Operation::new("RG", vec![1.into(), 0.into(), 0.into()]));
+        ops.push(Operation::new("w", vec![0.5.into()]));
+
+        for paragraph in &input.paragraphs {
+            for line in &paragraph.lines {
+                for word in &line.words {
                     let (wx_tl, wy_tl) = to_pdf_pt(&word.geometry.top_left);
                     let (wx_bl, wy_bl) = to_pdf_pt(&word.geometry.bottom_left);
                     let (wx_br, wy_br) = to_pdf_pt(&word.geometry.bottom_right);
 
-                    let font_size = ((wx_tl - wx_bl).powi(2) + (wy_tl - wy_bl).powi(2)).sqrt();
-                    let word_length = ((wx_br - wx_bl).powi(2) + (wy_br - wy_bl).powi(2)).sqrt();
+                    let wx_tr = wx_tl + (wx_br - wx_bl);
+                    let wy_tr = wy_tl + (wy_br - wy_bl);
 
-                    if font_size < 0.1 || word_length < 0.1 { continue; }
-
-                    let (target_x, target_y) = (wx_bl, wy_bl);
-
-                    let (px, py) = if line_len_sq < 0.001 {
-                        (target_x, target_y)
-                    } else {
-                        let t = ((target_x - lx1) * l_dx + (target_y - ly1) * l_dy) / line_len_sq;
-                        (lx1 + t * l_dx, ly1 + t * l_dy)
-                    };
-
-                    if is_new_block || line.direction != old_dir {
-                        ops.push(Operation::new("Tm", vec![
-                            prec(a).into(), prec(b).into(), prec(c).into(), prec(d).into(),
-                            prec(px).into(), prec(py).into()
-                        ]));
-                        is_new_block = false;
-                    } else {
-                        let dx = px - old_x;
-                        let dy = py - old_y;
-                        let tx = dx * a + dy * b;
-                        let ty = dx * c + dy * d;
-                        ops.push(Operation::new("Td", vec![prec(tx).into(), prec(ty).into()]));
-                    }
-
-                    old_x = px;
-                    old_y = py;
-                    old_dir = line.direction;
-
-                    if (font_size - old_fontsize).abs() > 0.01 {
-                        ops.push(Operation::new("Tf", vec![font_ref.clone(), prec(font_size).into()]));
-                        old_fontsize = font_size;
-                    }
-
-                    let char_count = word.text.encode_utf16().count() as f64;
-                    let h_scale = if char_count > 0.0 {
-                        let raw = K_CHAR_WIDTH * (100.0 * word_length) / (font_size * char_count);
-                        raw.clamp(1.0, 2000.0)
-                    } else {
-                        100.0
-                    };
-                    ops.push(Operation::new("Tz", vec![prec(h_scale).into()]));
-
-                    let mut utf16_bytes: Vec<u8> = word.text.encode_utf16().flat_map(|x| x.to_be_bytes()).collect();
-                    utf16_bytes.push(0x00); utf16_bytes.push(0x20);
-                    let hex_str = Object::String(utf16_bytes, StringFormat::Hexadecimal);
-                    ops.push(Operation::new("TJ", vec![Object::Array(vec![hex_str])]));
+                    ops.push(Operation::new(
+                        "m",
+                        vec![prec(wx_bl).into(), prec(wy_bl).into()],
+                    ));
+                    ops.push(Operation::new(
+                        "l",
+                        vec![prec(wx_br).into(), prec(wy_br).into()],
+                    ));
+                    ops.push(Operation::new(
+                        "l",
+                        vec![prec(wx_tr).into(), prec(wy_tr).into()],
+                    ));
+                    ops.push(Operation::new(
+                        "l",
+                        vec![prec(wx_tl).into(), prec(wy_tl).into()],
+                    ));
+                    ops.push(Operation::new("h", vec![]));
+                    ops.push(Operation::new("S", vec![]));
                 }
             }
-            ops.push(Operation::new("ET", vec![]));
         }
-
-        let content = Content { operations: ops };
-        let mut content_stream = Stream::new(dictionary! {}, content.encode()?);
-        let _ = content_stream.compress();
-        let content_id = self.doc.add_object(content_stream);
-
-        let page_dict = dictionary! {
-            "Type" => "Page",
-            "Parent" => self.pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), prec(width_pts).into(), prec(height_pts).into()],
-            "Contents" => content_id,
-            "Resources" => dictionary! {
-                "Font" => dictionary! { FONT_NAME => self.font_id.clone() },
-                "XObject" => dictionary! { image_name => image_id },
-                "ProcSet" => vec!["PDF".into(), "Text".into(), "ImageB".into(), "ImageC".into(), "ImageI".into()]
-            }
-        };
-        let page_id = self.doc.add_object(page_dict);
-        self.page_ids.push(page_id.into());
-
-        Ok(())
+        ops.push(Operation::new("Q", vec![]));
     }
 
-    pub fn finalize(mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        self.finalized = true;
-        let count = self.page_ids.len() as i64;
-        let pages_dict = dictionary! {
-            "Type" => "Pages",
-            "Kids" => self.page_ids,
-            "Count" => count,
-        };
-        self.doc.objects.insert(self.pages_id, Object::Dictionary(pages_dict));
+    ops.extend(ocr_operations(width_pts, height_pts, font_ref, input));
 
-        let catalog_id = self.doc.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => self.pages_id,
-        });
-        self.doc.trailer.set("Root", catalog_id);
+    let content_id = add_compressed_content(&mut doc, ops)?;
 
-        let mut buffer = Vec::new();
-        self.doc.save_to(&mut buffer)?;
-        Ok(buffer)
-    }
+    let page_dict = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), prec(width_pts).into(), prec(height_pts).into()],
+        "Contents" => content_id,
+        "Resources" => dictionary! {
+            "Font" => dictionary! { FONT_NAME => font_id },
+            "XObject" => dictionary! { image_name => image_id },
+            "ProcSet" => vec!["PDF".into(), "Text".into(), "ImageB".into(), "ImageC".into(), "ImageI".into()]
+        }
+    };
+    let page_id = doc.add_object(page_dict);
+
+    let pages_dict = dictionary! {
+        "Type" => "Pages",
+        "Kids" => vec![page_id.into()],
+        "Count" => 1i64,
+    };
+    doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut buffer = Vec::new();
+    doc.save_to(&mut buffer)?;
+    Ok(buffer)
 }
 
-// --- 5. FFI ---
+fn ocr_document_inplace(
+    pdf_bytes: &[u8],
+    json_opts: &[Option<&str>],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut doc = Document::load_mem(pdf_bytes)?;
+    let font_obj = add_glyphless_font(&mut doc);
+
+    // Pass 1 — read-only: collect (page_id, mediabox) in page order
+    let page_info: Vec<(ObjectId, [f64; 4])> = doc
+        .get_pages()
+        .into_values()
+        .map(|id| {
+            let mb = get_media_box(&doc, id).unwrap_or([0.0, 0.0, 612.0, 792.0]);
+            (id, mb)
+        })
+        .collect();
+
+    for (i, (page_id, mb)) in page_info.iter().enumerate() {
+        let json_str = match json_opts.get(i).and_then(|o| *o) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let input: OCRInput = serde_json::from_str(json_str)?;
+        let width_pts = mb[2] - mb[0];
+        let height_pts = mb[3] - mb[1];
+
+        let font_ref = Object::Name(FONT_NAME.into());
+        let ops = ocr_operations(width_pts, height_pts, font_ref, input);
+
+        let content_id = add_compressed_content(&mut doc, ops)?;
+
+        let existing_contents = doc
+            .objects
+            .get(page_id)
+            .and_then(|o| {
+                if let Object::Dictionary(d) = o {
+                    Some(d)
+                } else {
+                    None
+                }
+            })
+            .and_then(|d| d.get(b"Contents").ok().cloned());
+
+        let new_contents = match existing_contents {
+            Some(Object::Reference(id)) => {
+                Object::Array(vec![Object::Reference(id), Object::Reference(content_id)])
+            }
+            Some(Object::Array(mut arr)) => {
+                arr.push(Object::Reference(content_id));
+                Object::Array(arr)
+            }
+            _ => Object::Reference(content_id),
+        };
+
+        if let Some(Object::Dictionary(page_dict)) = doc.objects.get_mut(page_id) {
+            page_dict.set("Contents", new_contents);
+        }
+
+        add_font_to_page_resources(&mut doc, *page_id, font_obj.clone());
+    }
+
+    let mut buffer = Vec::new();
+    doc.save_to(&mut buffer)?;
+    Ok(buffer)
+}
 
 #[repr(C)]
 pub struct PdfBuffer {
@@ -424,59 +622,17 @@ fn vec_to_pdf_buffer(mut vec: Vec<u8>) -> PdfBuffer {
     let capacity = vec.capacity();
     let data = vec.as_mut_ptr();
     std::mem::forget(vec);
-    PdfBuffer { data, len, capacity }
-}
-
-#[no_mangle]
-pub extern "C" fn pdf_builder_new() -> *mut PdfBuilder {
-    Box::into_raw(Box::new(PdfBuilder::new()))
-}
-
-#[no_mangle]
-pub extern "C" fn pdf_builder_add_page(
-    builder: *mut PdfBuilder,
-    img_ptr: *const u8,
-    img_len: usize,
-    width_px: u32,
-    height_px: u32,
-    dpi: f64,
-    json_ptr: *const c_char,
-) -> i32 {
-    if builder.is_null() || img_ptr.is_null() || json_ptr.is_null() {
-        return 0;
-    }
-    let builder = unsafe { &mut *builder };
-    let image_bytes = unsafe { slice::from_raw_parts(img_ptr, img_len) };
-    let json_str = unsafe { CStr::from_ptr(json_ptr).to_string_lossy() };
-
-    match builder.add_page(image_bytes, width_px, height_px, dpi, &json_str) {
-        Ok(_) => { clear_last_error(); 1 }
-        Err(e) => { set_last_error(e.as_ref()); 0 }
+    PdfBuffer {
+        data,
+        len,
+        capacity,
     }
 }
 
+/// # Safety
+/// `img_ptr` must point to `img_len` valid bytes; `json_ptr` must be a valid null-terminated C string.
 #[no_mangle]
-pub extern "C" fn pdf_builder_finalize(builder: *mut PdfBuilder) -> PdfBuffer {
-    if builder.is_null() {
-        return PdfBuffer { data: std::ptr::null_mut(), len: 0, capacity: 0 };
-    }
-    let builder = unsafe { Box::from_raw(builder) };
-    match builder.finalize() {
-        Ok(vec) => { clear_last_error(); vec_to_pdf_buffer(vec) }
-        Err(e) => { set_last_error(e.as_ref()); PdfBuffer { data: std::ptr::null_mut(), len: 0, capacity: 0 } }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn pdf_builder_free(builder: *mut PdfBuilder) {
-    if !builder.is_null() {
-        unsafe { drop(Box::from_raw(builder)); }
-    }
-}
-
-/// Single-page convenience wrapper — backward compatible.
-#[no_mangle]
-pub extern "C" fn generate_pdf_from_ocr(
+pub unsafe extern "C" fn generate_pdf_from_ocr(
     img_ptr: *const u8,
     img_len: usize,
     width_px: u32,
@@ -485,33 +641,90 @@ pub extern "C" fn generate_pdf_from_ocr(
     json_ptr: *const c_char,
 ) -> PdfBuffer {
     if img_ptr.is_null() || json_ptr.is_null() {
-        return PdfBuffer { data: std::ptr::null_mut(), len: 0, capacity: 0 };
+        return PdfBuffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
     }
     let image_bytes = unsafe { slice::from_raw_parts(img_ptr, img_len) };
     let json_str = unsafe { CStr::from_ptr(json_ptr).to_string_lossy() };
 
-    let mut builder = PdfBuilder::new();
-    let result = builder.add_page(image_bytes, width_px, height_px, dpi, &json_str)
-        .and_then(|_| builder.finalize());
-
-    match result {
-        Ok(vec) => { clear_last_error(); vec_to_pdf_buffer(vec) }
-        Err(e) => { set_last_error(e.as_ref()); PdfBuffer { data: std::ptr::null_mut(), len: 0, capacity: 0 } }
+    match build_single_page_pdf(image_bytes, width_px, height_px, dpi, &json_str) {
+        Ok(vec) => {
+            clear_last_error();
+            vec_to_pdf_buffer(vec)
+        }
+        Err(e) => {
+            set_last_error(e.as_ref());
+            PdfBuffer {
+                data: std::ptr::null_mut(),
+                len: 0,
+                capacity: 0,
+            }
+        }
     }
 }
 
 #[no_mangle]
 pub extern "C" fn free_pdf_buffer(buf: PdfBuffer) {
     if !buf.data.is_null() {
-        unsafe { let _ = Vec::from_raw_parts(buf.data, buf.len, buf.capacity); }
+        unsafe {
+            let _ = Vec::from_raw_parts(buf.data, buf.len, buf.capacity);
+        }
+    }
+}
+
+/// # Safety
+/// `pdf_ptr` must point to `pdf_len` valid bytes; `json_array` must point to `page_count` valid C string pointers.
+#[no_mangle]
+pub unsafe extern "C" fn pdf_ocr_document(
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+    json_array: *const *const c_char,
+    page_count: i32,
+) -> PdfBuffer {
+    if pdf_ptr.is_null() || json_array.is_null() || page_count < 0 {
+        return PdfBuffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+    }
+    let pdf_bytes = unsafe { slice::from_raw_parts(pdf_ptr, pdf_len) };
+    let json_ptrs = unsafe { slice::from_raw_parts(json_array, page_count as usize) };
+
+    let json_strings: Vec<Option<std::borrow::Cow<str>>> = json_ptrs
+        .iter()
+        .map(|&ptr| {
+            if ptr.is_null() {
+                None
+            } else {
+                Some(unsafe { CStr::from_ptr(ptr).to_string_lossy() })
+            }
+        })
+        .collect();
+    let json_opts: Vec<Option<&str>> = json_strings.iter().map(|o| o.as_deref()).collect();
+
+    match ocr_document_inplace(pdf_bytes, &json_opts) {
+        Ok(vec) => {
+            clear_last_error();
+            vec_to_pdf_buffer(vec)
+        }
+        Err(e) => {
+            set_last_error(e.as_ref());
+            PdfBuffer {
+                data: std::ptr::null_mut(),
+                len: 0,
+                capacity: 0,
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- prec ---
 
     #[test]
     fn prec_rounds_down() {
@@ -535,9 +748,9 @@ mod tests {
         assert_eq!(prec(1234.5678), 1234.568);
     }
 
-    // --- clip_baseline ---
-
-    fn pt(x: f64, y: f64) -> Point { Point { x, y } }
+    fn pt(x: f64, y: f64) -> Point {
+        Point { x, y }
+    }
 
     #[test]
     fn clip_baseline_nearly_horizontal_clips() {

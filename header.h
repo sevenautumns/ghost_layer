@@ -12,20 +12,16 @@ typedef struct {
 // The pointer is valid until the next FFI call on this thread.
 const char* pdf_get_last_error(void);
 
-// Single-page convenience API.
-// Returns {NULL, 0} on error. Caller must free with free_pdf_buffer().
+// Image + OCR JSON → single-page PDF.
+// Returns {NULL, 0, 0} on error. Caller must free with free_pdf_buffer().
 PdfBuffer generate_pdf_from_ocr(const uint8_t* img_ptr, size_t img_len, uint32_t width_px, uint32_t height_px, double dpi, const char* json_ptr);
 
-// Frees a PdfBuffer returned by generate_pdf_from_ocr or pdf_builder_finalize.
+// Frees a PdfBuffer returned by any API function.
 void free_pdf_buffer(PdfBuffer buf);
 
-// Multi-page builder API.
-// pdf_builder_new: caller owns the returned pointer; free with pdf_builder_free OR pdf_builder_finalize.
-void*     pdf_builder_new(void);
-// pdf_builder_add_page: returns 1 on success, 0 on error.
-int       pdf_builder_add_page(void* builder, const uint8_t* img_ptr, size_t img_len, uint32_t width_px, uint32_t height_px, double dpi, const char* json_ptr);
-// pdf_builder_finalize: consumes the builder (do not call pdf_builder_free after).
-// Returns {NULL, 0} on error. Caller must free result with free_pdf_buffer().
-PdfBuffer pdf_builder_finalize(void* builder);
-// pdf_builder_free: frees builder without producing a PDF. No-op if builder is NULL.
-void      pdf_builder_free(void* builder);
+// PDF + OCR JSON array → PDF with invisible text layer (in-place overlay).
+// json_array is an array of page_count C-strings (one per page).
+// A NULL entry skips OCR for that page and copies it unchanged.
+// Returns the finished PDF. Caller must free with free_pdf_buffer().
+// Returns {NULL, 0, 0} on error. Check pdf_get_last_error() on failure.
+PdfBuffer pdf_ocr_document(const uint8_t* pdf_ptr, size_t pdf_len, const char** json_array, int page_count);
