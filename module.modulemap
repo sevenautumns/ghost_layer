@@ -1,0 +1,4 @@
+module GhostLayer {
+    header "header.h"
+    export *
+}

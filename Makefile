@@ -25,6 +25,7 @@ apple:
 		-output target/libghostlayer-macos.a
 	mkdir -p $(HEADERS)
 	cp header.h $(HEADERS)/
+	cp module.modulemap $(HEADERS)/
 	xcodebuild -create-xcframework \
 		-library target/aarch64-apple-ios/release/libghostlayer.a \
 		-headers $(HEADERS) \
