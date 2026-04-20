@@ -46,14 +46,6 @@ struct Geometry {
     bottom_right: Point,
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq)]
-#[serde(rename_all = "camelCase")]
-enum Direction {
-    LeftToRight,
-    RightToLeft,
-    TopToBottom,
-}
-
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct OCRWord {
@@ -65,7 +57,6 @@ struct OCRWord {
 #[serde(rename_all = "camelCase")]
 struct OCRLine {
     geometry: Geometry,
-    direction: Direction,
     words: Vec<OCRWord>,
 }
 
@@ -311,23 +302,17 @@ fn add_font_to_page_resources(doc: &mut Document, page_id: ObjectId, font_obj: O
 fn ocr_operations(
     width_pts: f64,
     height_pts: f64,
+    x_off: f64,
+    y_off: f64,
     font_ref: Object,
     input: OCRInput,
 ) -> Vec<Operation> {
-    let to_pdf_pt = |p: &Point| -> (f64, f64) { (p.x * width_pts, p.y * height_pts) };
+    let to_pdf_pt =
+        |p: &Point| -> (f64, f64) { (x_off + p.x * width_pts, y_off + p.y * height_pts) };
 
     let mut ops = Vec::new();
 
     for paragraph in input.paragraphs {
-        ops.push(Operation::new("BT", vec![]));
-        ops.push(Operation::new("Tr", vec![3.into()]));
-
-        let mut old_x = 0.0;
-        let mut old_y = 0.0;
-        let mut old_fontsize = 0.0;
-        let mut old_dir = Direction::LeftToRight;
-        let mut is_new_block = true;
-
         for line in paragraph.lines {
             let (lp1, lp2) = level_baseline(line.geometry.bottom_left, line.geometry.bottom_right);
             let (lx1, ly1) = to_pdf_pt(&lp1);
@@ -342,6 +327,14 @@ fn ocr_operations(
             let b = theta.sin();
             let c = -theta.sin();
             let d = theta.cos();
+
+            ops.push(Operation::new("BT", vec![]));
+            ops.push(Operation::new("Tr", vec![3.into()]));
+
+            let mut old_x = 0.0;
+            let mut old_y = 0.0;
+            let mut old_fontsize = 0.0;
+            let mut is_first_word = true;
 
             for word in line.words {
                 if word.text.trim().is_empty() {
@@ -368,7 +361,7 @@ fn ocr_operations(
                     (lx1 + t * l_dx, ly1 + t * l_dy)
                 };
 
-                if is_new_block || line.direction != old_dir {
+                if is_first_word {
                     ops.push(Operation::new(
                         "Tm",
                         vec![
@@ -380,18 +373,20 @@ fn ocr_operations(
                             round3(py).into(),
                         ],
                     ));
-                    is_new_block = false;
+                    is_first_word = false;
                 } else {
                     let dx = px - old_x;
                     let dy = py - old_y;
                     let tx = dx * a + dy * b;
                     let ty = dx * c + dy * d;
-                    ops.push(Operation::new("Td", vec![round3(tx).into(), round3(ty).into()]));
+                    ops.push(Operation::new(
+                        "Td",
+                        vec![round3(tx).into(), round3(ty).into()],
+                    ));
                 }
 
                 old_x = px;
                 old_y = py;
-                old_dir = line.direction;
 
                 if (font_size - old_fontsize).abs() > 0.01 {
                     ops.push(Operation::new(
@@ -420,8 +415,9 @@ fn ocr_operations(
                 let hex_str = Object::String(utf16_bytes, StringFormat::Hexadecimal);
                 ops.push(Operation::new("TJ", vec![Object::Array(vec![hex_str])]));
             }
+
+            ops.push(Operation::new("ET", vec![]));
         }
-        ops.push(Operation::new("ET", vec![]));
     }
 
     ops
@@ -508,7 +504,9 @@ fn build_single_page_pdf(
         ops.push(Operation::new("Q", vec![]));
     }
 
-    ops.extend(ocr_operations(width_pts, height_pts, font_ref, input));
+    ops.extend(ocr_operations(
+        width_pts, height_pts, 0.0, 0.0, font_ref, input,
+    ));
 
     let content_id = add_compressed_content(&mut doc, ops)?;
 
@@ -569,9 +567,11 @@ fn ocr_document_inplace(
         let input: OCRInput = serde_json::from_str(json_str)?;
         let width_pts = mb[2] - mb[0];
         let height_pts = mb[3] - mb[1];
+        let x_off = mb[0];
+        let y_off = mb[1];
 
         let font_ref = Object::Name(FONT_NAME.into());
-        let ops = ocr_operations(width_pts, height_pts, font_ref, input);
+        let ops = ocr_operations(width_pts, height_pts, x_off, y_off, font_ref, input);
 
         let content_id = add_compressed_content(&mut doc, ops)?;
 
