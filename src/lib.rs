@@ -641,6 +641,15 @@ pub struct PdfBuffer {
     capacity: usize,
 }
 
+enum DocVariant {
+    Images(Vec<(Vec<u8>, u32, u32, f64, Option<String>)>),
+    Ocr(Vec<Option<String>>),
+}
+
+pub struct GhostLayerDoc {
+    variant: DocVariant,
+}
+
 fn vec_to_pdf_buffer(mut vec: Vec<u8>) -> PdfBuffer {
     let len = vec.len();
     let capacity = vec.capacity();
@@ -760,6 +769,163 @@ pub unsafe extern "C" fn pdf_ocr_document(
                 capacity: 0,
             }
         }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ghost_layer_doc_new_images() -> *mut GhostLayerDoc {
+    Box::into_raw(Box::new(GhostLayerDoc {
+        variant: DocVariant::Images(Vec::new()),
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ghost_layer_doc_add_image_page(
+    doc: *mut GhostLayerDoc,
+    img_ptr: *const u8,
+    img_len: usize,
+    width_px: u32,
+    height_px: u32,
+    dpi: f64,
+    json_ptr: *const c_char,
+) {
+    if doc.is_null() || img_ptr.is_null() {
+        return;
+    }
+    let doc = unsafe { &mut *doc };
+    let DocVariant::Images(ref mut pages) = doc.variant else {
+        return;
+    };
+    let img = unsafe { slice::from_raw_parts(img_ptr, img_len) }.to_vec();
+    let json = if json_ptr.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(json_ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    pages.push((img, width_px, height_px, dpi, json));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ghost_layer_doc_finish_images(doc: *mut GhostLayerDoc) -> PdfBuffer {
+    if doc.is_null() {
+        return PdfBuffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+    }
+    let doc = unsafe { Box::from_raw(doc) };
+    let DocVariant::Images(raw_pages) = doc.variant else {
+        return PdfBuffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+    };
+    let pages: Vec<ImagePage> = raw_pages
+        .iter()
+        .map(|(img, w, h, dpi, json)| ImagePage {
+            image_bytes: img,
+            width_px: *w,
+            height_px: *h,
+            dpi: *dpi,
+            json_input: json.as_deref(),
+        })
+        .collect();
+    match build_pdf_from_images(&pages) {
+        Ok(vec) => {
+            clear_last_error();
+            vec_to_pdf_buffer(vec)
+        }
+        Err(e) => {
+            set_last_error(e.as_ref());
+            PdfBuffer {
+                data: std::ptr::null_mut(),
+                len: 0,
+                capacity: 0,
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn ghost_layer_doc_new_ocr() -> *mut GhostLayerDoc {
+    Box::into_raw(Box::new(GhostLayerDoc {
+        variant: DocVariant::Ocr(Vec::new()),
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ghost_layer_doc_add_ocr_page(
+    doc: *mut GhostLayerDoc,
+    json_ptr: *const c_char,
+) {
+    if doc.is_null() {
+        return;
+    }
+    let doc = unsafe { &mut *doc };
+    let DocVariant::Ocr(ref mut entries) = doc.variant else {
+        return;
+    };
+    let json = if json_ptr.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(json_ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    entries.push(json);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ghost_layer_doc_finish_ocr(
+    doc: *mut GhostLayerDoc,
+    pdf_ptr: *const u8,
+    pdf_len: usize,
+) -> PdfBuffer {
+    if doc.is_null() || pdf_ptr.is_null() {
+        return PdfBuffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+    }
+    let doc = unsafe { Box::from_raw(doc) };
+    let DocVariant::Ocr(entries) = doc.variant else {
+        return PdfBuffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+    };
+    let pdf_bytes = unsafe { slice::from_raw_parts(pdf_ptr, pdf_len) };
+    let json_opts: Vec<Option<&str>> = entries.iter().map(|o| o.as_deref()).collect();
+    match ocr_document_inplace(pdf_bytes, &json_opts) {
+        Ok(vec) => {
+            clear_last_error();
+            vec_to_pdf_buffer(vec)
+        }
+        Err(e) => {
+            set_last_error(e.as_ref());
+            PdfBuffer {
+                data: std::ptr::null_mut(),
+                len: 0,
+                capacity: 0,
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ghost_layer_doc_free(doc: *mut GhostLayerDoc) {
+    if !doc.is_null() {
+        drop(unsafe { Box::from_raw(doc) });
     }
 }
 
