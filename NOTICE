@@ -1,0 +1,18 @@
+GhostLayer
+Copyright 2026 sevenautumns
+
+This product includes software developed by the Tesseract OCR project.
+The invisible text overlay technique used in this library is based on
+Tesseract's PDF renderer (https://github.com/tesseract-ocr/tesseract).
+
+The file src/pdf.ttf (GlyphLessFont) is copied from the Tesseract OCR engine.
+
+  Author:    Zdenko Podobny
+  Copyright 2020, Google Inc.
+  Licensed under the Apache License, Version 2.0
+  http://www.apache.org/licenses/LICENSE-2.0
+
+The logo at assets/Ghost.svg is the sole property of Sina Friedrich.
+
+The test images in the tests/ directory are sourced from Wikimedia Commons                                                                                                                                                            
+and are provided with no restrictions (public domain). 

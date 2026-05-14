@@ -1,0 +1,21 @@
+[formatter.nixfmt]
+command = "nixfmt"
+includes = ["*.nix"]
+
+[formatter.prettier]
+command = "prettier"
+options = ["--tab-width", "4"]
+includes = ["*.md", "*.yml", "*.yaml", "*.json"]
+
+[formatter.swiftformat]
+command = "swiftformat"
+includes = ["*.swift"]
+
+[formatter.rustfmt]
+command = "rustfmt"
+includes = ["*.rs"]
+
+[formatter.taplo]
+command = "taplo"
+options = ["format"]
+includes = ["*.toml"]

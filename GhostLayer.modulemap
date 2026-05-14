@@ -1,0 +1,4 @@
+module GhostLayerFFI {
+    header "header.h"
+    export *
+}
